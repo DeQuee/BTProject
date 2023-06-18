@@ -1,260 +1,394 @@
-/*
- * Copyright (c) 2023 Nordic Semiconductor ASA
- *
- * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
- */
+//Detta är framtida main applikation för bluetooth Control och Status-lager. 
 
-
+#include "SensorControl.h"
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/gap.h>
-#include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/uuid.h>
-#include <zephyr/bluetooth/addr.h>
 #include <zephyr/bluetooth/conn.h>
-#include <bluetooth/services/lbs.h>
+#include <zephyr/device.h>
 #include <zephyr/drivers/sensor.h>
 #include <stdio.h>
-
-
-#include <dk_buttons_and_leds.h>
-
-
-static struct bt_le_adv_param *adv_param = BT_LE_ADV_PARAM((BT_LE_ADV_OPT_CONNECTABLE|BT_LE_ADV_OPT_USE_IDENTITY), /* Connectable advertising and use identity address */
-                BT_GAP_ADV_FAST_INT_MIN_1, /* 0x30 units, 48 units, 30ms */
-                BT_GAP_ADV_FAST_INT_MAX_1, /* 0x60 units, 96 units, 60ms */
-                NULL); /* Set to NULL for undirected advertising*/
-
-
-LOG_MODULE_REGISTER(Lesson3_Exercise2, LOG_LEVEL_INF);
-struct bt_conn *my_conn = NULL;
-
-/* STEP 11.2 - Create variable that holds callback for MTU negotiation */
-static struct bt_gatt_exchange_params exchange_params;
-
-/* STEP 13.4 - Forward declaration of exchange_func(): */
-static void exchange_func(struct bt_conn *conn, uint8_t att_err, struct bt_gatt_exchange_params *params);
-
-
+#include <zephyr/types.h>
+#include <stddef.h>
+#include <string.h>
+#include <errno.h>
+#include <zephyr/sys/printk.h>
+#include <zephyr/sys/byteorder.h>
+#include <zephyr/bluetooth/hci.h>
+#include <zephyr/bluetooth/conn.h>
+#include <zephyr/bluetooth/uuid.h>
+#include <zephyr/bluetooth/gatt.h>
+#include <zephyr/logging/log.h>
+#include <zephyr/pm/pm.h>
 
 #define DEVICE_NAME             CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN         (sizeof(DEVICE_NAME) - 1)
 
-#define USER_BUTTON             DK_BTN1_MSK
-#define RUN_STATUS_LED          DK_LED1
-#define CONNECTION_STATUS_LED   DK_LED2
-#define RUN_LED_BLINK_INTERVAL  1000
+#define RUN_LED_BLINK_INTERVAL  5000
+
+#define THREAD_STACK_SIZE       5000   
 
 
 
-static const struct bt_data ad[] = {
-	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
+
+
+/*
+Below are the variables which are used in the callback functions.
+*/
+
+static int startSens = 0;
+static int stopSens = 0;
+static int sensorStatus = 0;
+static bool measureVal1 = 0;
+static bool measureVal2 = 0;
+static unsigned long user_control_register;
+static unsigned long user_config_register;
+static int dummy_Val_1 = 0;
+static int dummy_Val_2 = 0;
+static struct sensor_value Val_1; //The volatile sensor values are currently saved as
+static struct sensor_value Val_2; //a struct, from an earlier version. which had an integer and fractional value. But it can be anything
+static int safeVal_1;             //that works with the function. For now we use the dummy values instead.
+static int safeVal_2;
+static bool app_button_state;
+//const struct device *const dht11 = DEVICE_DT_GET_ONE(aosong_dht);
+    //this registers the dht sensor, this also requires some extra text
+    //found in the overlay. 
+
+//standard advertisement setup
+static const struct bt_data ad[] = 
+{
+    BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+    BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
 };
 
-static const struct bt_data sd[] = {
-	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_128_ENCODE(0x00001523, 0x1212, 0xefde, 0x1523, 0x785feabcd123)),
+//standard scan setup
+static const struct bt_data sd[] = 
+{
+    BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_SENSORCONTROL_SERVICE_val),
 };
 
-/* STEP 7.1 - Define the function to update the connection's PHY */
-static void update_phy(struct bt_conn *conn)
+
+
+
+//A sensorfunction that creates a 16 char buffer with current time and prints.
+//Not currently used but useful regardless if one wants values with timestamps outside
+//of logging.   
+static const char *now_str(void)
 {
-    int err;
-    const struct bt_conn_le_phy_param preferred_phy = {
-        .options = BT_CONN_LE_PHY_OPT_NONE,
-        .pref_rx_phy = BT_GAP_LE_PHY_2M,
-        .pref_tx_phy = BT_GAP_LE_PHY_2M,
-    };
-    err = bt_conn_le_phy_update(conn, &preferred_phy);
-    if (err) {
-        LOG_ERR("bt_conn_le_phy_update() returned %d", err);
-    }
+    static char buf[16]; /* ...HH:MM:SS.MMM */
+    uint32_t now = k_uptime_get_32();
+    unsigned int ms = now % MSEC_PER_SEC;
+    unsigned int s;
+    unsigned int min;
+    unsigned int h;
+
+    now /= MSEC_PER_SEC;
+    s = now % 60U;
+    now /= 60U;
+    min = now % 60U;
+    now /= 60U;
+    h = now;
+
+    snprintf(buf, sizeof(buf), "%u:%02u:%02u.%03u",
+         h, min, s, ms);
+    return buf;
 }
 
-/* STEP 10 - Define the function to update the connection's data length */
-static void update_data_length(struct bt_conn *conn)
-{
-    int err;
-    struct bt_conn_le_data_len_param my_data_len = {
-        .tx_max_len = BT_GAP_DATA_LEN_MAX,
-        .tx_max_time = BT_GAP_DATA_TIME_MAX,
-    };
-    err = bt_conn_le_data_len_update(my_conn, &my_data_len);
-    if (err) {
-        LOG_ERR("data_len_update failed (err %d)", err);
-    }
-}
+//advertising parameters are set through a simple macro. 
+static struct bt_le_adv_param *adv_param = BT_LE_ADV_PARAM((BT_LE_ADV_OPT_CONNECTABLE|BT_LE_ADV_OPT_USE_IDENTITY), /* Connectable advertising and use identity address */
+                800, /*Min Advertising Interval 500ms (800*0.625ms) */
+                801, /*Max Advertising Interval 500.625ms (801*0.625ms)*/
+                NULL); /* Set to NULL for undirected advertising*/
 
-/* STEP 11.1 - Define the function to update the connection's MTU */
-static void update_mtu(struct bt_conn *conn)
-{
-    int err;
-    exchange_params.func = exchange_func;
-    err = bt_gatt_exchange_mtu(conn, &exchange_params);
-    if (err) {
-        LOG_ERR("bt_gatt_exchange_mtu failed (err %d)", err);
-    }
-}
+/*
+CONNECTION CALLBACK FUNCTIONS
+-----------------------------------------------------------------------------
+*/
 
-/* Callbacks */
-void on_connected(struct bt_conn *conn, uint8_t err)
+
+static void on_connected(struct bt_conn *conn, uint8_t err)
 {
-    if (err) {
-        LOG_ERR("Connection error %d", err);
-        return;
-    }
-    LOG_INF("Connected");
-    my_conn = bt_conn_ref(conn);
-    dk_set_led(CONNECTION_STATUS_LED, 1);
-    /* STEP 1.1 - Declare a structure to store the connection parameters */
-    struct bt_conn_info info;
-    err = bt_conn_get_info(conn, &info);
-    if (err) {
-        LOG_ERR("bt_conn_get_info() returned %d", err);
+
+
+    if (err) 
+    {
+        printk("Connection failed (err %u)\n", err);
         return;
     }
 
     
-	 /* STEP 1.2 - Add the connection parameters to your log */
-    double connection_interval = info.le.interval*1.25; // in ms
-    uint16_t supervision_timeout = info.le.timeout*10; // in ms
-    LOG_INF("Connection parameters: interval %.2f ms, latency %d intervals, timeout %d ms", connection_interval, info.le.latency, supervision_timeout);
-
-	/* STEP 7.2 - Update the PHY mode */
-    update_phy(my_conn);
-	
-   /* STEP 13.5 - Update the data length and MTU */
-    update_data_length(my_conn);
-    update_mtu(my_conn);
-
+    printk("Connected\n");
 }
 
-void on_disconnected(struct bt_conn *conn, uint8_t reason)
+static void on_disconnected(struct bt_conn *conn, uint8_t reason)
 {
-    LOG_INF("Disconnected. Reason %d", reason);
-    dk_set_led(CONNECTION_STATUS_LED, 0);
-    bt_conn_unref(my_conn);
-}
 
-/* STEP 4.2 - Add the callback for connection parameter updates */
-void on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t latency, uint16_t timeout)
-{
-    double connection_interval = interval*1.25;         // in ms
-    uint16_t supervision_timeout = timeout*10;          // in ms
-    LOG_INF("Connection parameters updated: interval %.2f ms, latency %d intervals, timeout %d ms", connection_interval, latency, supervision_timeout);
-}
 
-/* STEP 8.1 - Write a callback function to inform about updates in the PHY */
-void on_le_phy_updated(struct bt_conn *conn, struct bt_conn_le_phy_info *param)
+    printk("Disconnected (reason %u)\n", reason);
+}
+/*
+END OF CONNECTION CALLBACKS----------------------------------------------------------------------------------
+*/
+
+
+
+/*
+WORK ITEMS SUBMITTED BY THE CONTROL REGISTER ||||| ---------------------------------------------------------------
+                                             vvvvv
+*/
+
+static void app_Value_1_Write_impl(struct k_work work) 
 {
-    // PHY Updated
-    if (param->tx_phy == BT_CONN_LE_TX_POWER_PHY_1M) {
-        LOG_INF("PHY updated. New PHY: 1M");
+
+
+    printk("The Value_1 work item has been started\n");
+
+    startSens = 1; //Currently symbolic, the idea is that it means the sensor is busy insofar as other callbacks are concerned.  
+
+    if (!measureVal1)
+    {
+        printk("The Value_1 measurement is not enabled");
+        startSens = 0; //important that we mark that the sensor is no longer busy. 
+        return 0;
+
     }
-    else if (param->tx_phy == BT_CONN_LE_TX_POWER_PHY_2M) {
-        LOG_INF("PHY updated. New PHY: 2M");
-    }
-    else if (param->tx_phy == BT_CONN_LE_TX_POWER_PHY_CODED_S8) {
-        LOG_INF("PHY updated. New PHY: Long Range");
-    }
+
+
+    printk("The sensor is ready, starting Value_1 measurement\n");
+
+
+    dummy_Val_1++;
+    safeVal_1 = dummy_Val_1;
+
+    return;
+
 }
 
-/* STEP 13.1 - Write a callback function to inform about updates in data length*/
-void on_le_data_len_updated(struct bt_conn *conn, struct bt_conn_le_data_len_info *info)
+static void app_Value_2_Write_impl(struct k_work work)  
+{                                                       
+
+
+
+   printk("The Value_2 work item has been reached\n");
+
+
+    startSens = 1;
+    if (!measureVal2)   //This tests for if the user has toggled this type of measurement. 
+    {                   //Largely symbolic of desire for user configuration and maybe not necessary in this form 
+                        //depending on final product. 
+                        //But some configuration from the user end will no doubt be part of it. 
+
+        printk("The Value_2 measurement is not enabled\n");
+        startSens = 0;
+        return;
+    
+    }    
+
+
+    printk("The sensor is ready, starting Value_2 measurement\n");
+
+
+    dummy_Val_2++; //dummy measurement
+    safeVal_2 = dummy_Val_2;    
+    startSens = 0;
+
+
+    return;  
+
+}
+
+
+
+/*
+END OF WORK ITEMS -----------------------------------------------------------------
+*/
+
+//K_WORK_DEFINES OF WORK ITEMS.
+static K_WORK_DEFINE(Val_1_update, app_Value_1_Write_impl);
+static K_WORK_DEFINE(Val_2_update, app_Value_2_Write_impl);
+
+/*
+APPLICATION CALLBACK FUNCTIONS
+-------------------------------------------------------------------------------------------------------------
+*/
+
+static void app_control(uint8_t val)
 {
-    uint16_t tx_len     = info->tx_max_len;
-    uint16_t tx_time    = info->tx_max_time;
-    uint16_t rx_len     = info->rx_max_len;
-    uint16_t rx_time    = info->rx_max_time;
-    LOG_INF("Data length updated. Length %d/%d bytes, time %d/%d us", tx_len, rx_len, tx_time, rx_time);
+
+
+    printk("You have now set the value of the control register to %lu\n", user_control_register);
+    
+
+    user_control_register = (user_control_register | val);
+    
+    switch (user_control_register)
+    {
+        case MeasureTemperature:
+            printk("Start measuring Value_1\n"); 
+            k_work_submit(&Val_1_update);  
+            break;         
+        case MeasureMoisture:                        
+            printk("Start measuring Value_2\n");
+            k_work_submit(&Val_2_update);
+            break;
+        default:
+            printk("Incorrect sensor input\n");
+    }
+    user_control_register = 0;
+
 }
 
-struct bt_conn_cb connection_callbacks = {
+static void app_configure(uint8_t val)
+{
+
+
+    user_config_register = val; //adds the value to the register, bitwise OR since we want to keep the config
+    
+    switch (user_config_register)
+    {
+        case ToggleTemperature:
+            measureVal1 = !measureVal1;
+            printk("MeasureVal1 is = %d", measureVal1);
+            break;
+        case ToggleMoisture:
+            measureVal2 = !measureVal2;
+            printk("MeasureVal2 is = %d", measureVal2);
+            break;
+        default:
+            printk("Incorrect config input, user_config = %lu\n", user_config_register);
+    
+    } 
+}
+
+static uint8_t app_status()
+{
+
+
+    return (uint8_t)startSens; //should be simple enough for now
+
+}
+
+
+static int app_Read_Function_1()
+{
+    if (startSens == 0)
+    {
+
+
+        return safeVal_1;
+    
+    }
+    else
+    {
+
+
+        printk("The sensor is busy currently\n");
+        return 0;
+
+    }
+}
+
+
+
+static int app_Read_Function_2()
+{
+    if (startSens == 0)
+    {
+
+
+        return safeVal_2;
+    
+    }
+    else
+    {
+
+
+        printk("The sensor is busy currently\n");
+        return 0;
+        
+    }
+}
+
+
+/*
+END OF APPLICATION CALLBACK FUNCTIONS-----------------------------------------------------------------------------
+*/
+
+
+
+/*
+Below, a callback struct is created in the application. The functions listed in
+it are connected to the struct in the SensorControl.c file through
+the init function in the main area which uses function pointers to do so.
+*/
+
+
+struct bt_conn_cb connection_callbacks = 
+{
     .connected              = on_connected,
-    .disconnected           = on_disconnected,
-    /* STEP 4.1 - Add the callback for connection parameter updates */
-    .le_param_updated       = on_le_param_updated,
-    /* STEP 8.3 - Add the callback for PHY mode updates */
-    .le_phy_updated         = on_le_phy_updated,
-    /* STEP 13.2 - Add the callback for data length updates */
-    .le_data_len_updated    = on_le_data_len_updated,
+    .disconnected           = on_disconnected,  
 };
 
-/* STEP 13.3 - Implement callback function for MTU exchange */
-static void exchange_func(struct bt_conn *conn, uint8_t att_err,
-			  struct bt_gatt_exchange_params *params)
-{
-	LOG_INF("MTU exchange %s", att_err == 0 ? "successful" : "failed");
-    if (!att_err) {
-        uint16_t payload_mtu = bt_gatt_get_mtu(conn) - 3;   // 3 bytes used for Attribute headers.
-        LOG_INF("New MTU: %d bytes", payload_mtu);
-    }
-}
+struct control_CB control_callbacks = 
+{ 
+        .Status = app_status,
+        .ControlInput = app_control,
+        .Value_1 = app_Read_Function_1,
+        .Value_2 = app_Read_Function_2,
+        .Config    = app_configure, 
+};
 
-static void button_changed(uint32_t button_state, uint32_t has_changed)
+
+
+
+void main (void)
 {
+
+
     int err;
-    if (has_changed & USER_BUTTON) {
-        LOG_INF("Button changed");
-        err = bt_lbs_send_button_state(button_state ? true : false);
-        if (err) {
-            LOG_ERR("Couldn't send notification. err: %d", err);
-        }
+
+
+    printk("Starting Bluetooth Controller Prototype \n");
+
+    err = bt_enable(NULL);
+
+    if(err)
+    {
+
+
+        printk("BT init failed\n");
+    
     }
-}
-
-static int init_button(void)
-{
-	int err;
-
-	err = dk_buttons_init(button_changed);
-	if (err) {
-		LOG_INF("Cannot init buttons (err: %d)", err);
-	}
-
-	return err;
-}
-
-void main(void)
-{
-	int blink_status = 0;
-	int err;
-
-	LOG_INF("Starting Lesson 3 - Exercise 2\n");
-
-	err = dk_leds_init();
-	if (err) {
-		LOG_ERR("LEDs init failed (err %d)", err);
-		return;
-	}
-	
-	err = init_button();
-	if (err) {
-		LOG_ERR("Button init failed (err %d)", err);
-		return;
-	}
 
     bt_conn_cb_register(&connection_callbacks);
 
-	err = bt_enable(NULL);
-	if (err) {
-		LOG_ERR("Bluetooth init failed (err %d)", err);
-		return;
-	}
 
-	LOG_INF("Bluetooth initialized");
-	err = bt_le_adv_start(adv_param, ad, ARRAY_SIZE(ad),
-			      sd, ARRAY_SIZE(sd));
-	if (err) {
-		LOG_ERR("Advertising failed to start (err %d)", err);
-		return;
-	}
+    err = SensorControlInit(&control_callbacks);
 
-	LOG_INF("Advertising successfully started");
+    if(err)
+    {
 
-	for (;;) {
-		dk_set_led(RUN_STATUS_LED, (++blink_status) % 2);
-		k_sleep(K_MSEC(RUN_LED_BLINK_INTERVAL));
-	}
+
+        printk("control callback failed initialisation\n");
+    
+    }
+
+    err = bt_le_adv_start(adv_param, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+
+    if (err)
+    {
+
+
+        printk("advertisement failed\n");
+    
+    }
+
+
+    for (;;)
+    {   //We are idle from here. Awaiting some action from the BT_RX thread which will eventually
+        //drip into the callback functions here. 
+        k_sleep(K_MSEC(RUN_LED_BLINK_INTERVAL));
+    }    
 }
